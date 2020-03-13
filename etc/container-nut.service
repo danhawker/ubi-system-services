@@ -1,0 +1,19 @@
+[Unit]
+Description=NUT Service Podman Container
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm -f "nut-service"
+
+ExecStart=/usr/bin/podman run --name nut-service -v /opt/containers/nut/etc/ups:/etc/ups:Z --device /dev/bus/usb/005/002 --net host nut-ubi7
+
+ExecReload=-/usr/bin/podman stop "nut-service"
+ExecReload=-/usr/bin/podman rm "nut-service"
+ExecStop=-/usr/bin/podman stop "nut-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

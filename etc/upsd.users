@@ -1,0 +1,16 @@
+# Define Local and Remote UPS Users
+# Local Admin User
+[admin]
+	password = supersecurepassword
+	actions = ALL
+	instcmds = ALL
+
+# Local Monitor User (upsmon)
+[upsmon]
+	password = monitor
+	upsmon master
+
+# Remote Monitor User (upsmon)
+[remoteclient]
+	password = remote
+	upsmon slave

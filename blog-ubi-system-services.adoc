@@ -1,0 +1,202 @@
+== Containerised Services with RHEL 8 and the Red Hat Universal Base Image 
+
+It is often said that necessity is the mother of invention, and a few weeks ago, necessity reared its head, with the death of a small physical server I have at home, that runs core infrastructure services.
+
+That server was pretty ordinary in every way. It ran RHEL7 as the Operating System, and the services were simple configurations of DHCPD, BIND, Mosquitto and NUT, the Network UPS Tookit. I had recent backups, so could get the services back up and running pretty quickly, but I took the opportunity to be a touch inventive, and start from scratch with RHEL8, and see if I could build out the services using the new Red Hat Universal Base Image container images.
+
+If honest, for DHCPD, BIND and Mosquitto, it was all very, very simple and hence very, very boring to setup and get working. However, NUT was a little more interesting, and hence the focus for this post.
+
+The Red Hat Universal Base Image (UBI), is a lightweight container image, that can be used to build and distribute container images, based on RHEL. It comes in a variety of versions, targeting boh core RHEL functionality (ubi7 and ubi8), and runtimes like node.js, Java and Python. In addition, systemd enabled images (ubi7-init and ubi8-init) are also supplied for those needing to run containerised system services.
+
+=== NUT
+
+For those who have never heard of it, NUT is a set of monitoring utilities and daemons that allow the proactive control and monitoring of power devices such as an Uninterruptable Power Supply. Within my network, I use NUT to monitor for power outages, and if required, power down servers should a long power outage occur. NUT communicates with the UPS devices using a number of methods, but in my case this was using a USB-HID based control cable.
+
+As noted, NUT utilises a number of simple daemons to provide the overall service. These include a driver (usbhid-ups), a server that clients connect to (upsd), and a monitoring agent that queries the UPS (uspmon).
+
+This multiple daemon, interconnected service is an ideal candidate for the advanced process management capabilities of systemd, and hence I'll be using the `ubi-init` container image as a base.
+
+=== Pre-Requisites
+
+I'm presuming that you have an up-to-date and registered RHEL8 host to build and run the containers on. As we're running on RHEL8, we'll be using Podman to run the containerised service, so make sure podman is installed.
+
+  $ sudo yum install podman
+
+=== Download the Container Image
+
+You need a Red Hat Account to download the UBI images. If you don't already have an account, take a look at the Red Hat Developer account, which is a free Red Hat account which gives you access to lots of Red Hat technologies to aid in development. https://developers.redhat.io
+
+.Login
+
+$ sudo podman login -u "rh_username" registry.redhat.io
+
+You can also login using a service account, which is useful for when automating the build process with a CI tool.
+
+$ sudo podman login -u "service_account_name" -p "long_token" registry.redhat.io
+
+.Pull the Base Image
+
+$ sudo podman pull registry.redhat.io/ubi7/ubi-init
+
+=== Create the Dockerfile
+
+The following Dockerfile simply enables EPEL and installs any pre-requisites alongside NUT. We also expose the default port that the NUT server exposes for client access.
+
+[source]
+----
+FROM registry.redhat.io/ubi7/ubi-init
+
+RUN yum -y install --disableplugin=subscription-manager http://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm; \
+    yum -y install usbutils libusb-compat freeipmi nut nut-client; \
+    yum  --disableplugin=subscription-manager clean all; \
+    rm -rf /var/cache/yum
+
+RUN systemctl enable nut-server; systemctl enable nut-monitor
+
+VOLUME /etc/nut
+
+EXPOSE 3493
+
+CMD [ "/sbin/init" ]
+----
+
+=== Build the Image
+
+[source]
+----
+[root@eirene ~]# podman build -t nut-ubi7 .
+STEP 1: FROM registry.redhat.io/ubi7/ubi-init
+STEP 2: RUN yum -y install --disableplugin=subscription-manager http://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm;     yum -y install usbutils libusb freeipmi nut nut-client;     yum  --disableplugin=subscription-manager clean all;     rm -rf /var/cache/yum
+Loaded plugins: ovl, product-id, search-disabled-repos
+epel-release-latest-7.noarch.rpm                         |  15 kB     00:00
+Examining /var/tmp/yum-root-PpSUss/epel-release-latest-7.noarch.rpm: epel-release-7-11.noarch
+Marking /var/tmp/yum-root-PpSUss/epel-release-latest-7.noarch.rpm to be installed
+Resolving Dependencies
+<snipped>
+----
+
+=== Make it Work
+
+NUT requires a bit of gentle fettling and configuration to allow it to work. This includes access to the USB subsystem and network. 
+
+==== USB
+
+NUT needs access to the virtual tty interfaces that the USB driver makes available. The NUT RPM creates a NUT user and allows this user to access these interfaces using the `dialout` group and some clever udev magic. These users and permissions need to be added to the host, so that the services within the container, can access host provided resources. Here I simply recreate the user and group memberships, and add the appropriate UDEV rules.
+
+$ sudo useradd -c "Network UPS Tools" -u 57 -s /bin/false -r -d /var/lib/ups nut
+$ sudo usermod -G dialout nut
+
+The following is a snippet of the UDEV rules that need adding.
+
+./etc/udev/rules.d/62-nut-usbups.rules
+[source]
+----
+# This file is generated and installed by the Network UPS Tools package.
+
+ACTION!="add|change", GOTO="nut-usbups_rules_end"
+SUBSYSTEM=="usb_device", GOTO="nut-usbups_rules_real"
+SUBSYSTEM=="usb", GOTO="nut-usbups_rules_real"
+SUBSYSTEM!="usb", GOTO="nut-usbups_rules_end"
+
+LABEL="nut-usbups_rules_real"
+#  Krauler UP-M500VA  - blazer_usb
+ATTR{idVendor}=="0001", ATTR{idProduct}=="0000", MODE="664", GROUP="dialout"
+
+# Hewlett Packard
+#  e.g. ?  - usbhid-ups
+ATTR{idVendor}=="03f0", ATTR{idProduct}=="0001", MODE="664", GROUP="dialout"
+#  T500  - bcmxcp_usb
+ATTR{idVendor}=="03f0", ATTR{idProduct}=="1f01", MODE="664", GROUP="dialout"
+#  T750  - bcmxcp_usb
+ATTR{idVendor}=="03f0", ATTR{idProduct}=="1f02", MODE="664", GROUP="dialout"
+#  HP T750 INTL  - usbhid-ups
+ATTR{idVendor}=="03f0", ATTR{idProduct}=="1f06", MODE="664", GROUP="dialout"
+#  HP T1000 INTL  - usbhid-ups
+ATTR{idVendor}=="03f0", ATTR{idProduct}=="1f08", MODE="664", GROUP="dialout"
+<snipped>
+
+LABEL="nut-usbups_rules_end"
+----
+
+==== Network
+
+RHEL8 utilises firewalld and nftables as its default firewall implementation. Thankfully this has a prebuilt NUT service configuration, so enabling it is simple.
+
+$ sudo firewall-cmd --zone=public --add-service=nut --permanent
+success
+$ sudo firewall-cmd --reload
+success
+
+==== Configuration
+
+Each NUT service requires a config file. The easiest way to manage this, is to mount an external volumen into the container. I store all of my container config externally in `/opt/containers/`, use whatever you find appropriate.
+
+$ sudo mkdir -p /opt/containers/nut/etc/ups
+$ sudo setfacl -m u:57:-wx /opt/containers/nut/etc
+
+And copy all NUT configs into `/opt/containers/nut/etc/`.
+
+
+=== Systemd
+
+Now that we have the container all setup, we simply need to create a systemd unit file.
+
+NOTE: In the example below, my UPS is connected to `/dev/bus/usb/005/002` and I'm setting this directly. Ideally I'd want to use a UDEV rule to create a custom `/dev/` entry based on the USB device info that can be referenced, but this is left as an exercise for the reader.
+
+./etc/systemd/system/container-nut.service
+[source]
+----
+[Unit]
+Description=NUT Service Podman Container
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm -f "nut-service"
+
+ExecStart=/usr/bin/podman run --name nut-service -v /opt/containers/nut/etc/ups:/etc/ups:Z --device /dev/bus/usb/005/002 --net host nut-ubi7
+
+ExecReload=-/usr/bin/podman stop "nut-service"
+ExecReload=-/usr/bin/podman rm "nut-service"
+ExecStop=-/usr/bin/podman stop "nut-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+----
+
+=== Start it Up!!
+
+$ sudo systemctl daemon-reload
+
+$ sudo systemctl enable container-nut
+
+$ sudo systemctl start container-nut
+
+$ sudo systemctl status container-nut
+● container-nut.service - NUT Service Podman Container
+   Loaded: loaded (/etc/systemd/system/container-nut.service; enabled; vendor preset: disabled)
+   Active: active (running) since Wed 2019-06-12 03:18:41 BST; 1 months 24 days ago
+ Main PID: 1407 (podman)
+    Tasks: 12 (limit: 20336)
+   Memory: 66.9M
+   CGroup: /system.slice/container-nut.service
+           └─1407 /usr/bin/podman run --name nut-service -v /opt/containers/nut/etc/ups:/etc/ups:Z --device /dev/bus/usb/005/002 --net host nut-ubi7
+
+Cool!!
+
+=== Wrap Up
+
+Although slightly more involved than expected, the above demonstrates how simple it is to migrate core system services from RHEL7 to RHEL8, by containerising the service and using the `ubi7` Red Hat Universal Base Image.
+
+All code snippets, systemd unit files, and the source text for this blog can be found at Github.
+
+=== Further Reading
+Red Hat Universal Base Image: How it works in 3 minutes or less
+https://developers.redhat.com/blog/2019/07/29/red-hat-universal-base-image-how-it-works-in-3-minutes-or-less/
+
+Working with Red Hat Enterprise Linux Universal Base Images (UBI)
+https://developers.redhat.com/blog/2019/05/31/working-with-red-hat-enterprise-linux-universal-base-images-ubi/
+
